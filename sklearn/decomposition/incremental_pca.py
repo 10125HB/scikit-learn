@@ -4,6 +4,7 @@
 #         Giorgio Patrini
 # License: BSD 3 clause
 
+from __future__ import division
 import numpy as np
 from scipy import linalg
 
@@ -40,16 +41,6 @@ class IncrementalPCA(_BasePCA):
         Number of components to keep. If ``n_components `` is ``None``,
         then ``n_components`` is set to ``min(n_samples, n_features)``.
 
-    batch_size : int or None, (default=None)
-        The number of samples to use for each batch. Only used when calling
-        ``fit``. If ``batch_size`` is ``None``, then ``batch_size``
-        is inferred from the data and set to ``5 * n_features``, to provide a
-        balance between approximation accuracy and memory consumption.
-
-    copy : bool, (default=True)
-        If False, X will be overwritten. ``copy=False`` can be used to
-        save memory but is unsafe for general use.
-
     whiten : bool, optional
         When True (False by default) the ``components_`` vectors are divided
         by ``n_samples`` times ``components_`` to ensure uncorrelated outputs
@@ -59,6 +50,16 @@ class IncrementalPCA(_BasePCA):
         (the relative variance scales of the components) but can sometimes
         improve the predictive accuracy of the downstream estimators by
         making data respect some hard-wired assumptions.
+
+    copy : bool, (default=True)
+        If False, X will be overwritten. ``copy=False`` can be used to
+        save memory but is unsafe for general use.
+
+    batch_size : int or None, (default=None)
+        The number of samples to use for each batch. Only used when calling
+        ``fit``. If ``batch_size`` is ``None``, then ``batch_size``
+        is inferred from the data and set to ``5 * n_features``, to provide a
+        balance between approximation accuracy and memory consumption.
 
     Attributes
     ----------
@@ -71,7 +72,12 @@ class IncrementalPCA(_BasePCA):
     explained_variance_ratio_ : array, shape (n_components,)
         Percentage of variance explained by each of the selected components.
         If all components are stored, the sum of explained variances is equal
-        to 1.0
+        to 1.0.
+
+    singular_values_ : array, shape (n_components,)
+        The singular values corresponding to each of the selected components.
+        The singular values are equal to the 2-norms of the ``n_components``
+        variables in the lower-dimensional space.
 
     mean_ : array, shape (n_features,)
         Per-feature empirical mean, aggregate over calls to ``partial_fit``.
@@ -94,19 +100,33 @@ class IncrementalPCA(_BasePCA):
         The number of samples processed by the estimator. Will be reset on
         new calls to fit, but increments across ``partial_fit`` calls.
 
+    Examples
+    --------
+    >>> from sklearn.datasets import load_digits
+    >>> from sklearn.decomposition import IncrementalPCA
+    >>> X, _ = load_digits(return_X_y=True)
+    >>> transformer = IncrementalPCA(n_components=7, batch_size=200)
+    >>> # either partially fit on smaller batches of data
+    >>> transformer.partial_fit(X[:100, :])
+    IncrementalPCA(batch_size=200, copy=True, n_components=7, whiten=False)
+    >>> # or let the fit function itself divide the data into batches
+    >>> X_transformed = transformer.fit_transform(X)
+    >>> X_transformed.shape
+    (1797, 7)
+
     Notes
     -----
     Implements the incremental PCA model from:
     `D. Ross, J. Lim, R. Lin, M. Yang, Incremental Learning for Robust Visual
     Tracking, International Journal of Computer Vision, Volume 77, Issue 1-3,
     pp. 125-141, May 2008.`
-    See http://www.cs.toronto.edu/~dross/ivt/RossLimLinYang_ijcv.pdf
+    See https://www.cs.toronto.edu/~dross/ivt/RossLimLinYang_ijcv.pdf
 
     This model is an extension of the Sequential Karhunen-Loeve Transform from:
     `A. Levy and M. Lindenbaum, Sequential Karhunen-Loeve Basis Extraction and
     its Application to Images, IEEE Transactions on Image Processing, Volume 9,
     Number 8, pp. 1371-1374, August 2000.`
-    See http://www.cs.technion.ac.il/~mic/doc/skl-ip.pdf
+    See https://www.cs.technion.ac.il/~mic/doc/skl-ip.pdf
 
     We have specifically abstained from an optimization used by authors of both
     papers, a QR decomposition used in specific situations to reduce the
@@ -130,7 +150,6 @@ class IncrementalPCA(_BasePCA):
     See also
     --------
     PCA
-    RandomizedPCA
     KernelPCA
     SparsePCA
     TruncatedSVD
@@ -148,15 +167,15 @@ class IncrementalPCA(_BasePCA):
 
         Parameters
         ----------
-        X: array-like, shape (n_samples, n_features)
+        X : array-like, shape (n_samples, n_features)
             Training data, where n_samples is the number of samples and
             n_features is the number of features.
 
-        y: Passthrough for ``Pipeline`` compatibility.
+        y : Ignored
 
         Returns
         -------
-        self: object
+        self : object
             Returns the instance itself.
         """
         self.components_ = None
@@ -166,6 +185,7 @@ class IncrementalPCA(_BasePCA):
         self.singular_values_ = None
         self.explained_variance_ = None
         self.explained_variance_ratio_ = None
+        self.singular_values_ = None
         self.noise_variance_ = None
 
         X = check_array(X, copy=self.copy, dtype=[np.float64, np.float32])
@@ -176,7 +196,8 @@ class IncrementalPCA(_BasePCA):
         else:
             self.batch_size_ = self.batch_size
 
-        for batch in gen_batches(n_samples, self.batch_size_):
+        for batch in gen_batches(n_samples, self.batch_size_,
+                                 min_batch_size=self.n_components or 0):
             self.partial_fit(X[batch], check_input=False)
 
         return self
@@ -186,13 +207,17 @@ class IncrementalPCA(_BasePCA):
 
         Parameters
         ----------
-        X: array-like, shape (n_samples, n_features)
+        X : array-like, shape (n_samples, n_features)
             Training data, where n_samples is the number of samples and
             n_features is the number of features.
+        check_input : bool
+            Run check_array on X.
+
+        y : Ignored
 
         Returns
         -------
-        self: object
+        self : object
             Returns the instance itself.
         """
         if check_input:
@@ -202,11 +227,18 @@ class IncrementalPCA(_BasePCA):
             self.components_ = None
 
         if self.n_components is None:
-            self.n_components_ = n_features
+            if self.components_ is None:
+                self.n_components_ = min(n_samples, n_features)
+            else:
+                self.n_components_ = self.components_.shape[0]
         elif not 1 <= self.n_components <= n_features:
             raise ValueError("n_components=%r invalid for n_features=%d, need "
                              "more rows than columns for IncrementalPCA "
                              "processing" % (self.n_components, n_features))
+        elif not self.n_components <= n_samples:
+            raise ValueError("n_components=%r must be less or equal to "
+                             "the batch number of samples "
+                             "%d." % (self.n_components, n_samples))
         else:
             self.n_components_ = self.n_components
 
@@ -225,9 +257,10 @@ class IncrementalPCA(_BasePCA):
 
         # Update stats - they are 0 if this is the fisrt step
         col_mean, col_var, n_total_samples = \
-            _incremental_mean_and_var(X, last_mean=self.mean_,
-                                      last_variance=self.var_,
-                                      last_sample_count=self.n_samples_seen_)
+            _incremental_mean_and_var(
+                X, last_mean=self.mean_, last_variance=self.var_,
+                last_sample_count=np.repeat(self.n_samples_seen_, X.shape[1]))
+        n_total_samples = n_total_samples[0]
 
         # Whitening
         if self.n_samples_seen_ == 0:
@@ -245,7 +278,7 @@ class IncrementalPCA(_BasePCA):
 
         U, S, V = linalg.svd(X, full_matrices=False)
         U, V = svd_flip(U, V, u_based_decision=False)
-        explained_variance = S ** 2 / n_total_samples
+        explained_variance = S ** 2 / (n_total_samples - 1)
         explained_variance_ratio = S ** 2 / np.sum(col_var * n_total_samples)
 
         self.n_samples_seen_ = n_total_samples

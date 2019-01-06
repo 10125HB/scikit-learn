@@ -5,20 +5,13 @@
 
 import copy
 import warnings
+from collections import defaultdict
+from inspect import signature
 
 import numpy as np
 from scipy import sparse
-from .externals import six
-from .utils.fixes import signature
-from .utils.deprecation import deprecated
-from .exceptions import ChangedBehaviorWarning as _ChangedBehaviorWarning
+
 from . import __version__
-
-
-@deprecated("ChangedBehaviorWarning has been moved into the sklearn.exceptions"
-            " module. It will not be available here from version 0.19")
-class ChangedBehaviorWarning(_ChangedBehaviorWarning):
-    pass
 
 
 ##############################################################################
@@ -43,11 +36,11 @@ def clone(estimator, safe=True):
 
     Parameters
     ----------
-    estimator: estimator object, or list, tuple or set of objects
+    estimator : estimator object, or list, tuple or set of objects
         The estimator or group of estimators to be cloned
 
-    safe: boolean, optional
-        If safe is false, clone will fall back to a deepcopy on objects
+    safe : boolean, optional
+        If safe is false, clone will fall back to a deep copy on objects
         that are not estimators.
 
     """
@@ -55,7 +48,7 @@ def clone(estimator, safe=True):
     # XXX: not handling dictionaries
     if estimator_type in (list, tuple, set, frozenset):
         return estimator_type([clone(e, safe=safe) for e in estimator])
-    elif not hasattr(estimator, 'get_params'):
+    elif not hasattr(estimator, 'get_params') or isinstance(estimator, type):
         if not safe:
             return copy.deepcopy(estimator)
         else:
@@ -65,7 +58,7 @@ def clone(estimator, safe=True):
                             % (repr(estimator), type(estimator)))
     klass = estimator.__class__
     new_object_params = estimator.get_params(deep=False)
-    for name, param in six.iteritems(new_object_params):
+    for name, param in new_object_params.items():
         new_object_params[name] = clone(param, safe=False)
     new_object = klass(**new_object_params)
     params_set = new_object.get_params(deep=False)
@@ -74,57 +67,10 @@ def clone(estimator, safe=True):
     for name in new_object_params:
         param1 = new_object_params[name]
         param2 = params_set[name]
-        if param1 is param2:
-            # this should always happen
-            continue
-        if isinstance(param1, np.ndarray):
-            # For most ndarrays, we do not test for complete equality
-            if not isinstance(param2, type(param1)):
-                equality_test = False
-            elif (param1.ndim > 0
-                    and param1.shape[0] > 0
-                    and isinstance(param2, np.ndarray)
-                    and param2.ndim > 0
-                    and param2.shape[0] > 0):
-                equality_test = (
-                    param1.shape == param2.shape
-                    and param1.dtype == param2.dtype
-                    and (_first_and_last_element(param1) ==
-                         _first_and_last_element(param2))
-                )
-            else:
-                equality_test = np.all(param1 == param2)
-        elif sparse.issparse(param1):
-            # For sparse matrices equality doesn't work
-            if not sparse.issparse(param2):
-                equality_test = False
-            elif param1.size == 0 or param2.size == 0:
-                equality_test = (
-                    param1.__class__ == param2.__class__
-                    and param1.size == 0
-                    and param2.size == 0
-                )
-            else:
-                equality_test = (
-                    param1.__class__ == param2.__class__
-                    and (_first_and_last_element(param1) ==
-                         _first_and_last_element(param2))
-                    and param1.nnz == param2.nnz
-                    and param1.shape == param2.shape
-                )
-        else:
-            # fall back on standard equality
-            equality_test = param1 == param2
-        if equality_test:
-            warnings.warn("Estimator %s modifies parameters in __init__."
-                          " This behavior is deprecated as of 0.18 and "
-                          "support for this behavior will be removed in 0.20."
-                          % type(estimator).__name__, DeprecationWarning)
-        else:
+        if param1 is not param2:
             raise RuntimeError('Cannot clone object %s, as the constructor '
-                               'does not seem to set parameter %s' %
+                               'either does not set or modifies parameter %s' %
                                (estimator, name))
-
     return new_object
 
 
@@ -134,13 +80,13 @@ def _pprint(params, offset=0, printer=repr):
 
     Parameters
     ----------
-    params: dict
+    params : dict
         The dictionary to pretty print
 
-    offset: int
+    offset : int
         The offset in characters to add at the begin of each line.
 
-    printer:
+    printer : callable
         The function to convert entries to strings, typically
         the builtin str or repr
 
@@ -151,7 +97,7 @@ def _pprint(params, offset=0, printer=repr):
     params_list = list()
     this_line_length = offset
     line_sep = ',\n' + (1 + offset // 2) * ' '
-    for i, (k, v) in enumerate(sorted(six.iteritems(params))):
+    for i, (k, v) in enumerate(sorted(params.items())):
         if type(v) is float:
             # use str for representing floating point numbers
             # this way we get consistent representation across
@@ -233,21 +179,7 @@ class BaseEstimator(object):
         """
         out = dict()
         for key in self._get_param_names():
-            # We need deprecation warnings to always be on in order to
-            # catch deprecated param values.
-            # This is set in utils/__init__.py but it gets overwritten
-            # when running under python3 somehow.
-            warnings.simplefilter("always", DeprecationWarning)
-            try:
-                with warnings.catch_warnings(record=True) as w:
-                    value = getattr(self, key, None)
-                if len(w) and w[0].category == DeprecationWarning:
-                    # if the parameter is deprecated, don't show it
-                    continue
-            finally:
-                warnings.filters.pop(0)
-
-            # XXX: should we rather test if instance of estimator?
+            value = getattr(self, key, None)
             if deep and hasattr(value, 'get_params'):
                 deep_items = value.get_params().items()
                 out.update((key + '__' + k, val) for k, val in deep_items)
@@ -267,41 +199,59 @@ class BaseEstimator(object):
         self
         """
         if not params:
-            # Simple optimisation to gain speed (inspect is slow)
+            # Simple optimization to gain speed (inspect is slow)
             return self
         valid_params = self.get_params(deep=True)
-        for key, value in six.iteritems(params):
-            split = key.split('__', 1)
-            if len(split) > 1:
-                # nested objects case
-                name, sub_name = split
-                if name not in valid_params:
-                    raise ValueError('Invalid parameter %s for estimator %s. '
-                                     'Check the list of available parameters '
-                                     'with `estimator.get_params().keys()`.' %
-                                     (name, self))
-                sub_object = valid_params[name]
-                sub_object.set_params(**{sub_name: value})
+
+        nested_params = defaultdict(dict)  # grouped by prefix
+        for key, value in params.items():
+            key, delim, sub_key = key.partition('__')
+            if key not in valid_params:
+                raise ValueError('Invalid parameter %s for estimator %s. '
+                                 'Check the list of available parameters '
+                                 'with `estimator.get_params().keys()`.' %
+                                 (key, self))
+
+            if delim:
+                nested_params[key][sub_key] = value
             else:
-                # simple objects case
-                if key not in valid_params:
-                    raise ValueError('Invalid parameter %s for estimator %s. '
-                                     'Check the list of available parameters '
-                                     'with `estimator.get_params().keys()`.' %
-                                     (key, self.__class__.__name__))
                 setattr(self, key, value)
+                valid_params[key] = value
+
+        for key, sub_params in nested_params.items():
+            valid_params[key].set_params(**sub_params)
+
         return self
 
     def __repr__(self):
-        class_name = self.__class__.__name__
-        return '%s(%s)' % (class_name, _pprint(self.get_params(deep=False),
-                                               offset=len(class_name),),)
+        from .utils._pprint import _EstimatorPrettyPrinter
+
+        N_CHAR_MAX = 700  # number of non-whitespace or newline chars
+        N_MAX_ELEMENTS_TO_SHOW = 30  # number of elements to show in sequences
+
+        # use ellipsis for sequences with a lot of elements
+        pp = _EstimatorPrettyPrinter(
+            compact=True, indent=1, indent_at_name=True,
+            n_max_elements_to_show=N_MAX_ELEMENTS_TO_SHOW)
+
+        repr_ = pp.pformat(self)
+
+        # Use bruteforce ellipsis if string is very long
+        if len(''.join(repr_.split())) > N_CHAR_MAX:  # check non-blank chars
+            lim = N_CHAR_MAX // 2
+            repr_ = repr_[:lim] + '...' + repr_[-lim:]
+        return repr_
 
     def __getstate__(self):
+        try:
+            state = super(BaseEstimator, self).__getstate__()
+        except AttributeError:
+            state = self.__dict__.copy()
+
         if type(self).__module__.startswith('sklearn.'):
-            return dict(self.__dict__.items(), _sklearn_version=__version__)
+            return dict(state.items(), _sklearn_version=__version__)
         else:
-            return dict(self.__dict__.items())
+            return state
 
     def __setstate__(self, state):
         if type(self).__module__.startswith('sklearn.'):
@@ -313,7 +263,10 @@ class BaseEstimator(object):
                     "invalid results. Use at your own risk.".format(
                         self.__class__.__name__, pickle_version, __version__),
                     UserWarning)
-        self.__dict__.update(state)
+        try:
+            super(BaseEstimator, self).__setstate__(state)
+        except AttributeError:
+            self.__dict__.update(state)
 
 
 ###############################################################################
@@ -357,10 +310,10 @@ class RegressorMixin(object):
     def score(self, X, y, sample_weight=None):
         """Returns the coefficient of determination R^2 of the prediction.
 
-        The coefficient R^2 is defined as (1 - u/v), where u is the regression
-        sum of squares ((y_true - y_pred) ** 2).sum() and v is the residual
+        The coefficient R^2 is defined as (1 - u/v), where u is the residual
+        sum of squares ((y_true - y_pred) ** 2).sum() and v is the total
         sum of squares ((y_true - y_true.mean()) ** 2).sum().
-        Best possible score is 1.0 and it can be negative (because the
+        The best possible score is 1.0 and it can be negative (because the
         model can be arbitrarily worse). A constant model that always
         predicts the expected value of y, disregarding the input features,
         would get a R^2 score of 0.0.
@@ -368,7 +321,10 @@ class RegressorMixin(object):
         Parameters
         ----------
         X : array-like, shape = (n_samples, n_features)
-            Test samples.
+            Test samples. For some estimators this may be a
+            precomputed kernel matrix instead, shape = (n_samples,
+            n_samples_fitted], where n_samples_fitted is the number of
+            samples used in the fitting for the estimator.
 
         y : array-like, shape = (n_samples) or (n_samples, n_outputs)
             True values for X.
@@ -400,9 +356,12 @@ class ClusterMixin(object):
         X : ndarray, shape (n_samples, n_features)
             Input data.
 
+        y : Ignored
+            not used, present for API consistency by convention.
+
         Returns
         -------
-        y : ndarray, shape (n_samples,)
+        labels : ndarray, shape (n_samples,)
             cluster labels
         """
         # non-optimized default implementation; override when a better
@@ -427,6 +386,11 @@ class BiclusterMixin(object):
 
         Only works if ``rows_`` and ``columns_`` attributes exist.
 
+        Parameters
+        ----------
+        i : int
+            The index of the cluster.
+
         Returns
         -------
         row_ind : np.array, dtype=np.intp
@@ -442,6 +406,11 @@ class BiclusterMixin(object):
     def get_shape(self, i):
         """Shape of the i'th bicluster.
 
+        Parameters
+        ----------
+        i : int
+            The index of the cluster.
+
         Returns
         -------
         shape : (int, int)
@@ -453,9 +422,22 @@ class BiclusterMixin(object):
     def get_submatrix(self, i, data):
         """Returns the submatrix corresponding to bicluster `i`.
 
+        Parameters
+        ----------
+        i : int
+            The index of the cluster.
+        data : array
+            The data.
+
+        Returns
+        -------
+        submatrix : array
+            The submatrix corresponding to bicluster i.
+
+        Notes
+        -----
         Works with sparse matrices. Only works if ``rows_`` and
         ``columns_`` attributes exist.
-
         """
         from .utils.validation import check_array
         data = check_array(data, accept_sparse='csr')
@@ -510,9 +492,35 @@ class DensityMixin(object):
 
         Returns
         -------
-        score: float
+        score : float
         """
         pass
+
+
+class OutlierMixin(object):
+    """Mixin class for all outlier detection estimators in scikit-learn."""
+    _estimator_type = "outlier_detector"
+
+    def fit_predict(self, X, y=None):
+        """Performs outlier detection on X.
+
+        Returns -1 for outliers and 1 for inliers.
+
+        Parameters
+        ----------
+        X : ndarray, shape (n_samples, n_features)
+            Input data.
+
+        y : Ignored
+            not used, present for API consistency by convention.
+
+        Returns
+        -------
+        y : ndarray, shape (n_samples,)
+            1 for inliers, -1 for outliers.
+        """
+        # override for transductive outlier detectors like LocalOulierFactor
+        return self.fit(X).predict(X)
 
 
 ###############################################################################
@@ -524,10 +532,48 @@ class MetaEstimatorMixin(object):
 ###############################################################################
 
 def is_classifier(estimator):
-    """Returns True if the given estimator is (probably) a classifier."""
+    """Returns True if the given estimator is (probably) a classifier.
+
+    Parameters
+    ----------
+    estimator : object
+        Estimator object to test.
+
+    Returns
+    -------
+    out : bool
+        True if estimator is a classifier and False otherwise.
+    """
     return getattr(estimator, "_estimator_type", None) == "classifier"
 
 
 def is_regressor(estimator):
-    """Returns True if the given estimator is (probably) a regressor."""
+    """Returns True if the given estimator is (probably) a regressor.
+
+    Parameters
+    ----------
+    estimator : object
+        Estimator object to test.
+
+    Returns
+    -------
+    out : bool
+        True if estimator is a regressor and False otherwise.
+    """
     return getattr(estimator, "_estimator_type", None) == "regressor"
+
+
+def is_outlier_detector(estimator):
+    """Returns True if the given estimator is (probably) an outlier detector.
+
+    Parameters
+    ----------
+    estimator : object
+        Estimator object to test.
+
+    Returns
+    -------
+    out : bool
+        True if estimator is an outlier detector and False otherwise.
+    """
+    return getattr(estimator, "_estimator_type", None) == "outlier_detector"
